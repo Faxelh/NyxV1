@@ -1,0 +1,186 @@
+# Construit Nyx (SwiftUI + moteur Python) sur un Mac de GitHub.
+#
+# Résultat : l'artefact « Nyx-iPhone » contient Nyx.ipa, à installer avec
+# Sideloadly. Les erreurs de compilation s'affichent en rouge sur la page
+# de la construction (une capture suffit pour les corriger).
+
+name: iPhone
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  ios:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Code de Nyx (Swift + moteur)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Le nouveau code arrive dans nyx-src.zip ; les corrections ponctuelles dans patch/.
+          if [ -f nyx-src.zip ]; then unzip -o -q nyx-src.zip; fi
+          if [ -d patch ]; then cp -R patch/. .; fi
+          ICONS=ios/Resources/Assets.xcassets
+          mkdir -p "$ICONS/AppIcon.appiconset" "$ICONS/Logo.imageset"
+          # Icône sans transparence (exigé par iOS) : passage par JPEG.
+          sips -s format jpeg src/nyx/resources/nyx-1024.png --out /tmp/icon.jpg >/dev/null
+          sips -s format png /tmp/icon.jpg --out "$ICONS/AppIcon.appiconset/AppIcon.png" >/dev/null
+          cp src/nyx/resources/nyx.png "$ICONS/Logo.imageset/Logo.png"
+          ls ios ios/Sources
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Tests du moteur Python
+        # Un test qui échoue ne bloque pas la création de l'app : il est
+        # signalé en jaune sur la page de la construction.
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m unittest tests.test_engine tests.test_bridge 2>&1 | tee tests.log
+          STATUS=${PIPESTATUS[0]}
+          if [ "$STATUS" -ne 0 ]; then
+            grep -E "^(FAIL|ERROR):|Error:|error:|No module" tests.log | head -20 | while IFS= read -r line; do
+              echo "::warning title=Tests Python::${line:0:900}"
+            done
+          fi
+          exit $STATUS
+
+      - name: Python pour iPhone (Python-Apple-support)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG=$(gh api "repos/beeware/Python-Apple-support/releases?per_page=50" \
+                --jq '[.[] | select(.tag_name | startswith("3.13-")) | select(.prerelease | not)][0].tag_name')
+          echo "Python-Apple-support : $TAG"
+          gh release download "$TAG" -R beeware/Python-Apple-support -p "Python-3.13-iOS-support.*.tar.gz" -D support-dl
+          mkdir -p support-x ios/Support
+          tar -xzf support-dl/*.tar.gz -C support-x
+          XCF=$(find support-x -maxdepth 3 -type d -name "Python.xcframework" | head -1)
+          test -n "$XCF"
+          mv "$XCF" ios/Support/Python.xcframework
+          echo "Contenu :"
+          find ios/Support/Python.xcframework -maxdepth 3 -type d | head -40
+          echo "- Python-Apple-support : $TAG" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Moteur de Nyx et paquets (yt-dlp…)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ios/build-python/app/nyx
+          cp src/nyx/__init__.py src/nyx/bridge.py ios/build-python/app/nyx/
+          cp -R src/nyx/core src/nyx/engine ios/build-python/app/nyx/
+          PKGS="yt-dlp==2026.8.19 yt-dlp-ejs==0.8.0 requests urllib3 idna certifi charset-normalizer rubicon-objc"
+          python -m pip install --upgrade pip
+          python -m pip install --target ios/build-python/app_packages --no-deps --only-binary=:all: \
+              --platform any --python-version 3.13 --implementation py $PKGS \
+            || python -m pip install --target ios/build-python/app_packages --no-deps $PKGS
+          # Aucun module binaire de Mac ne doit partir sur l'iPhone.
+          find ios/build-python/app_packages -name "*.so" -print -delete
+          rm -rf ios/build-python/app_packages/bin
+          find ios/build-python -name "__pycache__" -prune -exec rm -rf {} +
+          ls ios/build-python/app_packages
+
+      - name: Projet Xcode
+        shell: bash
+        run: |
+          brew install xcodegen
+          cd ios && xcodegen generate
+
+      - name: Compiler pour iPhone et créer Nyx.ipa
+        shell: bash
+        run: |
+          # GitHub lance bash avec -e : on le retire pour pouvoir afficher les erreurs.
+          set +e -u -o pipefail
+          cd ios
+          xcodebuild -project Nyx.xcodeproj -scheme Nyx -configuration Release -sdk iphoneos \
+            -destination "generic/platform=iOS" -derivedDataPath build/device \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build > ../xcodebuild.log 2>&1
+          STATUS=$?
+          if [ $STATUS -ne 0 ]; then
+            grep -E "error:" ../xcodebuild.log | sed "s#$GITHUB_WORKSPACE/##g" | sort -u | head -40 > ../erreurs.txt
+            echo "===== ERREURS DE COMPILATION ====="
+            cat ../erreurs.txt
+            { echo "## Erreurs de compilation"; echo '```'; cat ../erreurs.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            while IFS= read -r line; do
+              echo "::error title=Compilation::${line:0:900}"
+            done < ../erreurs.txt
+            tail -n 80 ../xcodebuild.log
+            exit 1
+          fi
+          grep -E "Python :|Bibliothèque standard|module\(s\) binaire|Python installé" ../xcodebuild.log || true
+          APP=build/device/Build/Products/Release-iphoneos/Nyx.app
+          test -d "$APP"
+          rm -rf Payload ../Nyx.ipa
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry ../Nyx.ipa Payload
+          ls -lh ../Nyx.ipa
+          echo "- Nyx.ipa : $(du -h ../Nyx.ipa | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publier Nyx.ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nyx-iPhone
+          path: Nyx.ipa
+          retention-days: 30
+
+      - name: Test dans le simulateur (Python, yt-dlp, recherche)
+        timeout-minutes: 25
+        shell: bash
+        run: |
+          # GitHub lance bash avec -e : on le retire pour pouvoir afficher les erreurs.
+          set +e -u -o pipefail
+          UDID=$(xcrun simctl list devices available -j | python3 -c "
+          import json, sys
+          devices = json.load(sys.stdin)['devices']
+          runtimes = sorted((k for k in devices if 'iOS' in k), key=lambda k: [int(p) for p in k.rsplit('iOS-', 1)[-1].split('-') if p.isdigit()])
+          for runtime in reversed(runtimes):
+              phones = [d['udid'] for d in devices[runtime] if d['name'].startswith('iPhone')]
+              if phones:
+                  print(phones[0]); break
+          ")
+          echo "Simulateur : $UDID"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b || true
+          cd ios
+          xcodebuild -project Nyx.xcodeproj -scheme Nyx -configuration Debug -sdk iphonesimulator \
+            -destination "id=$UDID" -derivedDataPath build/sim CODE_SIGNING_ALLOWED=NO build > ../sim-build.log 2>&1
+          if [ $? -ne 0 ]; then
+            grep -E "error:" ../sim-build.log | sed "s#$GITHUB_WORKSPACE/##g" | sort -u | head -30 | while IFS= read -r line; do
+              echo "::error title=Simulateur (compilation)::${line:0:900}"
+            done
+            tail -n 60 ../sim-build.log
+            exit 1
+          fi
+          APP=$(find build/sim/Build/Products -maxdepth 2 -name "Nyx.app" | head -1)
+          xcrun simctl install "$UDID" "$APP"
+          SIMCTL_CHILD_NYX_SELFTEST=1 perl -e 'alarm shift; exec @ARGV' 300 \
+            xcrun simctl launch --console-pty "$UDID" com.faxel.nyx > ../selftest.log 2>&1 || true
+          tail -n 60 ../selftest.log
+          RESULT=$(grep -a "NYX-SELFTEST-RESULT" ../selftest.log | tail -1 || true)
+          {
+            echo "## Test dans le simulateur"
+            echo '```'
+            if [ -n "$RESULT" ]; then echo "$RESULT"; else echo "Aucun résultat : app non lancée ou arrêtée."; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if echo "$RESULT" | grep -q '"ok":true'; then
+            echo "::notice title=Simulateur::Python, yt-dlp et la recherche fonctionnent."
+          else
+            echo "::error title=Simulateur::Test raté : $RESULT"
+            grep -a -E "Traceback|Error|error" ../selftest.log | tail -n 20 | while IFS= read -r line; do
+              echo "::warning title=Journal::${line:0:900}"
+            done
+            exit 1
+          fi
